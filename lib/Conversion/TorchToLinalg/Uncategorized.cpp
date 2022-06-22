@@ -1625,6 +1625,72 @@ public:
 };
 } // namespace
 
+namespace {
+class ConvertAtenTriuOp : public OpConversionPattern<AtenTriuOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenTriuOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value input = adaptor.self();
+    Value diagonal = adaptor.diagonal();
+
+    auto inputType = input.getType().cast<RankedTensorType>();
+    uint64_t inputRank = inputType.getRank();
+
+    if (inputRank < 2)
+      return op.emitError(
+          "too few dimensions to compute triangular part of matrix");
+
+    // For each dimension, compute the affine expression and the dimension size.
+    SmallVector<AffineExpr> exprs;
+    SmallVector<Value> outputDims;
+    for (auto idx = 0UL; idx < inputRank; idx++) {
+      exprs.push_back(rewriter.getAffineDimExpr(idx));
+      outputDims.push_back(getDimOp(rewriter, loc, input, idx));
+    }
+
+    Type elementType = inputType.getElementType();
+    auto zero = getConstant(rewriter, loc, 0, elementType);
+
+    auto bodyBuilder = [&](OpBuilder &b, Location loc, ValueRange payloadArgs) {
+      // Use the indices of the two innermost dimensions.
+      auto rowIndex = rewriter.create<linalg::IndexOp>(loc, inputRank - 2);
+      Value rowIndexI64 = castIndexToInt64(rewriter, loc, rowIndex);
+      auto colIndex = rewriter.create<linalg::IndexOp>(loc, inputRank - 1);
+      Value colIndexI64 = castIndexToInt64(rewriter, loc, colIndex);
+
+      // columnIndex >= rowIndex + diagonal?
+      auto sum = rewriter.create<arith::AddIOp>(loc, rowIndexI64, diagonal);
+      auto pred = rewriter.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge,
+                                                 colIndexI64, sum);
+
+      Value scalar = payloadArgs[0];
+      auto select = rewriter.create<arith::SelectOp>(loc, pred, scalar, zero);
+      rewriter.create<linalg::YieldOp>(loc, select.getResult());
+    };
+
+    AffineMap identityMap = rewriter.getMultiDimIdentityMap(inputRank);
+    SmallVector<AffineMap> indexingMaps{2, identityMap};
+
+    StringRef iteratorName = getParallelIteratorTypeName();
+    SmallVector<StringRef> iteratorTypes{inputRank, iteratorName};
+
+    Value outVector =
+        rewriter.create<linalg::InitTensorOp>(loc, outputDims, elementType);
+    auto genericOp =
+        rewriter
+            .create<linalg::GenericOp>(loc, input.getType(), input, outVector,
+                                       indexingMaps, iteratorTypes, bodyBuilder)
+            .getResult(0);
+
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, input.getType(), genericOp);
+    return success();
+  }
+};
+} // namespace
+
 void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
     TypeConverter &typeConverter, RewritePatternSet &patterns,
     ConversionTarget &target) {
@@ -1654,4 +1720,6 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
   patterns.add<ConvertAtenNllLossBackwardOp>(typeConverter, context);
   patterns.add<ConvertTensorStaticInfoCastOp>(typeConverter, context);
   target.addIllegalOp<TensorStaticInfoCastOp>();
+  target.addIllegalOp<AtenTriuOp>();
+  patterns.add<ConvertAtenTriuOp>(typeConverter, context);
 }
